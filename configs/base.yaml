@@ -51,7 +51,9 @@ AUGMENTATION:
   LOSS_TYPE: 'cosine'
   EPOCHS: 50
   GENERIC: False
-  ALPHA: 0.5
+  ALPHA: 0.2
+  # add beta by wsj
+  BETA: 0
   INCLUDE_ORIG_TRAINING: True
   TEST_TIME_AUG: False
   CLIP_NN_LOSS: False

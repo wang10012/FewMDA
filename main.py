@@ -18,6 +18,8 @@ from utils import read_unknowns, nest_dict
 from clip_utils import get_features, evaluate, zeroshot_classifier, get_ensamble_preds, get_pred_overlap, get_nn_metrics
 import methods.augmentations
 
+from clip_utils import load_embeddings
+
 parser = argparse.ArgumentParser(description='CLIP Advice')
 parser.add_argument('--config', default='configs/base.yaml', help="config file")
 parser.add_argument('overrides', nargs='*', help="Any key=value arguments to override config values "
@@ -78,6 +80,7 @@ if args.EXP.IMAGE_FEATURES == 'clip':
 elif args.EXP.IMAGE_FEATURES == 'openclip':
     model, _, preprocess = open_clip.create_model_and_transforms(args.EXP.CLIP_MODEL, pretrained=args.EXP.CLIP_PRETRAINED_DATASET)
     model = model.to(torch.device('cuda'))
+    # model = model.to(device)
     clip_model = model
 else:
     model = getattr(torchvision.models, args.EXP.IMAGE_FEATURES)(pretrained=True)

@@ -32,6 +32,9 @@ from methods.lads_utils import get_domain_text_embs, DirectionLoss
 import omegaconf
 from omegaconf import OmegaConf
 
+from UDA.mmd_loss import *
+from UDA.coral_loss import *
+
 class Augment:
     """
     Class for augmenting clip embeddings in embedding space.
@@ -50,6 +53,8 @@ class Augment:
         self.domain_names = dh.DATASET_DOMAINS[self.cfg.DATA.DATASET]
         self.domain_indexes = []
         self.alpha = self.cfg.AUGMENTATION.ALPHA
+        # add self.beta by wsj
+        self.beta = self.cfg.AUGMENTATION.BETA
         self.include_orig = self.cfg.AUGMENTATION.INCLUDE_ORIG_TRAINING
         self.prompts = list(self.cfg.EXP.TEXT_PROMPTS)
         self.neutral_prompts = list(self.cfg.EXP.NEUTRAL_TEXT_PROMPTS)
@@ -250,6 +255,19 @@ class MLP(nn.Module):
         x = nnf.relu(self.fc1(x))
         x = self.fc2(x)
         return x
+    
+# add by wsj: Adversarial Domain Adaptation
+class Discriminator(nn.Module):
+    def __init__(self, input_dim=768, hidden_dim=384):
+        super(MLP, self).__init__()
+        self.fc1 = nn.Linear(input_dim, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, input_dim)
+
+    def forward(self, x): 
+        # print(x.dtype)
+        x = nnf.relu(self.fc1(x))
+        x = self.fc2(x)
+        return x
 
 # class DirectionLoss(torch.nn.Module):
 
@@ -276,9 +294,11 @@ class LADS(Augment):
     Trains the augmentation network with the domain alignment and class conssitency loss. Domain alignment loss code
     is taken from the StyleGAN-NADA paper(https://stylegan-nada.github.io). 
     """
-
-    def __init__(self, cfg, image_features, labels, group_labels, domain_labels, filenames, text_features, val_image_features, val_labels, val_group_labels, val_domain_labels):
+    # add few_target_domain_features
+    # by wsj
+    def __init__(self, cfg, weight_dict, few_target_domain_features,removed_style_img_embs, image_features, labels, group_labels, domain_labels, filenames, text_features, val_image_features, val_labels, val_group_labels, val_domain_labels):
         super().__init__(cfg, image_features, labels, group_labels, domain_labels, filenames, text_features)
+
         source_embeddings, target_embeddings = get_domain_text_embs(self.model, cfg, self.neutral_prompts, self.prompts, self.class_names)
         # target_embeddings is size (num_domains, num_classes, emb_size)
         # source_embeddings is size (num_source_domain_descriptions, num_classes, emb_size)
@@ -295,6 +315,19 @@ class LADS(Augment):
         self.val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=cfg.DATA.BATCH_SIZE, shuffle=True)
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        # add by wsj
+        self.few_target_domain_features = torch.from_numpy(few_target_domain_features).to(self.device)
+        self.removed_style_img_embs = torch.from_numpy(removed_style_img_embs).to(self.device)
+
+        self.mmd = MMDLoss(self.device)
+        self.l1 = nn.L1Loss()
+
+        # optuna
+        self.weight_dict = weight_dict
+        if self.weight_dict is not None:
+            print("weight_dict:", self.weight_dict)
+
         self.nets = []
         self.net_checkpoints = []
         self.uid = uuid.uuid4()
@@ -336,8 +369,8 @@ class LADS(Augment):
         for epoch in range(self.cfg.AUGMENTATION.EPOCHS):
             train_metrics = self.training_loop(self.train_loader, num_net, epoch, phase='train')
             val_metrics = self.training_loop(self.val_loader, num_net, epoch, phase='val')
-            if val_metrics['val loss'] < best_train_loss:
-                    best_train_loss = val_metrics['val loss']
+            if val_metrics['val lads loss'] < best_train_loss:
+                    best_train_loss = val_metrics['val lads loss']
                     best_epoch = epoch
                     self.net_checkpoints[num_net] = self.save_checkpoint(best_train_loss, epoch, num_net)
 
@@ -362,27 +395,99 @@ class LADS(Augment):
         diffs = torch.stack(dir_vectors)
         diffs /= diffs.norm(dim=-1, keepdim=True)
         return diffs
+    
+    # wsj add
+    def get_style_diffs_vectors(self, img_embs, labels):
+        """
+        Returns the diffs vectors of img_embs and style_removed_img_embs
+        """
+        diff_vectors = []
+
+        for (im, l) in zip(img_embs, labels):
+
+            diff = self.few_target_domain_features[l] - self.removed_style_img_embs[l]
+
+            if diff.norm() == 0:
+                print(diff)
+            diff_vectors.append(diff)
+
+        diffs = torch.stack(diff_vectors)
+        diffs /= diffs.norm(dim=-1, keepdim=True)
+        return diffs
 
     def training_loop(self, loader, num_net, epoch, phase='train'):
         if phase == 'train':
             self.nets[num_net].train()
         else:
             self.nets[num_net].eval()
-        train_directional_loss, train_class_loss, train_loss, total = 0, 0, 0, 0
+        train_directional_loss, train_class_loss, train_image_directional_loss, train_text_L1_loss ,train_image_L1_loss, train_mmd_loss, train_loss, total = 0, 0, 0, 0, 0, 0, 0, 0
         with torch.set_grad_enabled(phase == 'train'):
             for i, (inp, cls_target, cls_group, dom_target) in enumerate(loader):
                 inp, cls_target= inp.cuda().float(), cls_target.cuda().long()
                 cls_outputs = self.nets[num_net](inp)
                 text_diffs = self.get_direction_vectors(inp, cls_target, num_net)
                 im_diffs = cls_outputs - inp
-                # compute directional loss
+                # compute text directional loss
                 directional_loss = self.directional_loss(im_diffs / im_diffs.norm(dim=-1, keepdim=True), text_diffs).mean()
+
+                # compute image directional loss
+                style_im_diffs = self.get_style_diffs_vectors(inp, cls_target)
+                image_directional_loss = self.directional_loss(im_diffs / im_diffs.norm(dim=-1, keepdim=True), style_im_diffs).mean()
+
+                # compute text L1 loss
+                text_L1_loss = self.l1(im_diffs, text_diffs * text_diffs.norm(dim=-1, keepdim=True))
+
+                # compute image L1 loss
+                image_L1_loss = self.l1(im_diffs, style_im_diffs * style_im_diffs.norm(dim=-1, keepdim=True))
+
+                # compute cls_consist
                 cls_emb_targets = self.target_embeddings[num_net].T if self.cfg.AUGMENTATION.DOM_SPECIFIC_XE else self.class_text_embs
                 cls_logits = self.get_class_logits(cls_outputs, cls_emb_targets)
                 cls_consist = self.class_consistency_loss(cls_logits, cls_target)
-                loss = self.alpha * directional_loss + (1 - self.alpha) * cls_consist
-                train_class_loss += (1 - self.alpha) * cls_consist.item()
-                train_directional_loss += self.alpha * directional_loss.item()
+
+                # add by wsj
+                # compute mmd_loss
+                # print("type of few_target_domain_features:",type(self.few_target_domain_features))
+                # print(cls_outputs)
+                # print(self.few_target_domain_features)
+
+                mmd_loss = self.mmd(cls_outputs, self.few_target_domain_features)
+
+                # add by wsj
+                # compute coral loss
+                # coral_loss = CORAL(cls_outputs, self.few_target_domain_features, self.device)
+
+                # add new_loss to total loss # (1 - self.alpha - self.beta)
+                # loss = self.alpha * directional_loss + (1 - self.alpha - self.beta) * cls_consist + self.beta * mmd_loss
+                
+                # optuna
+                if self.weight_dict is not None:
+                    # print("weight_dict", self.weight_dict)
+                    weight_text_direction = self.weight_dict['weight_text_direction']
+                    weight_image_direction = self.weight_dict['weight_image_direction']
+                    weight_text_l1 = self.weight_dict["weight_text_l1"]
+                    weight_image_l1 = self.weight_dict["weight_image_l1"]
+                    weight_cls_consist = self.weight_dict["weight_cls_consist"]
+                    weight_mmd = self.weight_dict["weight_mmd"]
+
+                    loss = weight_text_direction * directional_loss + weight_image_direction * image_directional_loss + weight_text_l1 * text_L1_loss + weight_image_l1 * image_L1_loss + weight_cls_consist * cls_consist + weight_mmd * mmd_loss
+                    train_directional_loss += weight_text_direction * directional_loss.item()
+                    train_image_directional_loss += weight_image_direction * image_directional_loss.item()
+                    train_text_L1_loss += weight_text_l1 * text_L1_loss.item()
+                    train_image_L1_loss += weight_image_l1 * image_L1_loss.item()
+                    train_class_loss += weight_cls_consist * cls_consist.item()
+                    train_mmd_loss += weight_mmd * mmd_loss.item()
+                else:
+                    loss = 0.1 * directional_loss + 0.1 * image_directional_loss + 1 * text_L1_loss + 1 * image_L1_loss + 1 * cls_consist + 50 * mmd_loss
+
+                    train_directional_loss += 0.1 * directional_loss.item()
+                    train_image_directional_loss += 0.1 * image_directional_loss.item()
+                    train_text_L1_loss += 1 * text_L1_loss.item()
+                    train_image_L1_loss += 1 * image_L1_loss.item()
+                    train_class_loss += 1 * cls_consist.item()
+                    train_mmd_loss += 50 * mmd_loss.item()
+                    # train_mmd_loss += self.beta * mmd_loss.item()
+                    # train_coral_loss += self.beta * coral_loss.item()
 
                 if phase == 'train':
                     self.optimizer.zero_grad()
@@ -394,7 +499,7 @@ class LADS(Augment):
                 total += cls_target.size(0)
                 progress_bar(i, len(loader), 'Loss: %.3f'% (train_loss/(i+1)))
 
-        metrics = {f"{phase} class loss": train_class_loss/(i+1), f"{phase} directional loss": train_directional_loss/(i+1), f"{phase} loss": train_loss/(i+1), "epoch": epoch}
+        metrics = {f"{phase} text L1 loss": train_text_L1_loss/(i+1), f"{phase} image L1 loss": train_image_L1_loss/(i+1), f"{phase} class loss": train_class_loss/(i+1), f"{phase} directional loss": train_directional_loss/(i+1), f"{phase} image directional loss": train_image_directional_loss/(i+1), f"{phase} mmd loss": train_mmd_loss/(i+1), f"{phase} lads loss": train_loss/(i+1), "epoch": epoch}
         wandb.log(metrics)
         return metrics
 
@@ -538,6 +643,7 @@ class LADSBias(LADS):
                 nn_labels, _ = self.get_nn(inp, inp, cls_target) # this is a bit redundant
                 _, nn_logits = self.get_nn(cls_outputs, inp, cls_target)
                 regularization_loss = self.regularization_loss(nn_logits, nn_labels)
+
                 loss = self.alpha * directional_loss + (1 - self.alpha) * cls_consist + self.cfg.AUGMENTATION.NN_WEIGHT * regularization_loss
                 train_class_loss += (1 - self.alpha) * cls_consist.item()
                 train_directional_loss += self.alpha * directional_loss.item()

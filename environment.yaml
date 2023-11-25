@@ -36,4 +36,4 @@ dependencies:
     - transformers
     - pytorch_revgrad
     - open_clip_torch
-    - git+https://github.com/openai/CLIP.git
+   # - git+https://github.com/openai/CLIP.git

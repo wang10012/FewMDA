@@ -1,7 +1,7 @@
 EXP:
   ADVICE_METHOD: "ClipMLP"
   WANDB_SILENT: False
-  PROJ: "LADS_CUB_Replication"
+  PROJ: "LADS_WSJ_23_11_25"
   SEED: 0
   TEXT_PROMPTS: ['a painting of a {} bird.']
   NEUTRAL_TEXT_PROMPTS: ['a photo of a {} bird.']
